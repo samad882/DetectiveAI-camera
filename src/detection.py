@@ -61,10 +61,10 @@ class Detector:
     # │  WHERE LATENCY COMES FROM:                                   │
     # │    ┌─────────────────────────────────────────────────────┐   │
     # │    │  model.predict()  ← 95% of the time is spent here   │   │
-    # │    │    img_size=640   → resizes frame → runs 80 layers   │   │
-    # │    │    img_size=320   → 2x faster, slightly less detail  │   │
+    # │    │    img_size=640   → resizes frame → runs 80 layers  │   │
+    # │    │    img_size=320   → 2x faster, slightly less detail │   │
     # │    └─────────────────────────────────────────────────────┘   │
-    # │    post-processing (box parsing) ← ~5% of time              │
+    # │    post-processing (box parsing) ← ~5% of time               │
     # └──────────────────────────────────────────────────────────────┘
     def detect(self, frame, conf_threshold=0.25, img_size=640):
         # 📌 KEY CONCEPT: High-Resolution Timer (time.perf_counter)

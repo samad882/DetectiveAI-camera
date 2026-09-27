@@ -249,31 +249,170 @@ The codebase architecture in `src/rules.py` is **100% complete** for all 4 alert
 
 ---
 
-### Future Roadmap
+---
 
-#### Phase 1 — Combined Multi-Class Model
-Train a unified YOLOv8 model combining weapons, people, bags, and altercation poses so all 4 rules run simultaneously under one model.
+### 🚀 Upgrade Roadmap — New Era Architecture
 
-#### Phase 2 — Context-Aware Role Classification ("Smart Skip")
-> *"Not every gun is a threat — ignore authorized personnel."*
-
-Integrate a second classifier to check if the person holding the weapon is an authorized officer:
-- 👮 **Police Officer:** Detects uniform/badge ──► **Suppress Alert**
-- 🔒 **Security Guard:** Detects guard vest/ID ──► **Suppress Alert**
-- 🦹 **Unidentified Person:** No uniform detected ──► **🚨 Fire Weapon Alert**
+The next version upgrades from a Streamlit single-thread app to a **real-time web application** with a FastAPI backend and React frontend.
 
 ```
-Weapon Detected!
-       │
-       ▼
-Classify Person Holding Weapon
-       │
-       ├──► Uniform / Security Badge Recognized ──► Suppress Alert (Authorized)
-       │
-       └──► Civilian / Unidentified ──► 🚨 FIRE WEAPON ALERT
+TODAY                  PHASE 1              PHASE 2              PHASE 3
+──────────────────────────────────────────────────────────────────────────────
+Streamlit app     →   2x FASTER        →   3x Smarter      →   Real Web App
+(slow, local)         MPS/CUDA GPU          ByteTrack            FastAPI + React
+                      + Async Pipeline      (CPU only)           WebSocket stream
+                      ~50 FPS               ~55 FPS              ~70 FPS
 ```
 
-#### Phase 3 — Edge Deployment & Multi-Camera
-- **Dockerization:** Containerize app for seamless server deployment.
-- **RTSP IP Camera Streams:** Connect directly to commercial CCTV networks.
-- **NVIDIA Jetson Deployment:** Run inference directly on edge hardware for 4ms low latency.
+---
+
+#### ⚡ Phase 1 — Speed Revolution
+> **Goal:** Make the detection engine 2x faster without changing any features.
+
+**1a. Smart GPU Auto-Select (`src/detection.py`)**
+```python
+# Auto-picks the best available hardware:
+if torch.backends.mps.is_available():    # Mac M1/M2/M3 → Apple GPU
+    self.device = "mps"
+elif torch.cuda.is_available():          # Windows/Linux → NVIDIA GPU
+    self.device = "0"
+else:
+    self.device = "cpu"                  # Any CPU fallback
+```
+
+**1b. Async Pipeline (`src/pipeline.py` — new)**
+
+Current code is serial — detect → track → draw → wait. The new pipeline runs detection and display in **parallel threads** so the UI never freezes during inference.
+
+```
+Thread 1 (Detection):  [Frame 1] → [Frame 2] → [Frame 3]
+Thread 2 (Display):         ↑ show      ↑ show      ↑ show
+```
+
+| Platform | Before | After |
+|----------|--------|-------|
+| Mac M1/M2/M3 | ~20 FPS | **~50 FPS** |
+| Windows NVIDIA GPU | ~250 FPS | **~400 FPS** |
+| Any CPU | ~15 FPS | **~30 FPS** |
+
+---
+
+#### 🔄 Phase 2 — ByteTrack Tracker
+> **Goal:** Replace DeepSORT (heavy, needs GPU) with ByteTrack (pure math, any CPU).
+
+```
+DeepSORT:   Re-ID neural net (~15ms) + Kalman + Hungarian match
+ByteTrack:  IoU overlap (math only ~1ms) + Kalman + Hungarian match
+
+Result: 3x faster tracking, same accuracy, NO GPU required
+```
+
+```bash
+pip install supervision   # ByteTrack wrapper — easiest API
+```
+
+Changes only in `src/tracking.py` — same output format, everything else unchanged.
+
+---
+
+#### 🌐 Phase 3 — Real Web App (FastAPI + React)
+> **Goal:** Replace Streamlit with a professional browser-based surveillance dashboard.
+
+##### 3a. FastAPI Backend (`src/api.py`)
+
+```
+Python Pipeline ──► FastAPI Server ──► WebSocket ──► Browser
+                    │
+                    ├── /ws/video     WebSocket: streams JPEG frames live
+                    ├── /alerts       GET: returns recent alert list
+                    ├── /status       GET: FPS, active tracks, uptime
+                    ├── /config       POST: update detection thresholds
+                    ├── /source       POST: switch input (file/webcam/RTSP)
+                    ├── /start        POST: start pipeline
+                    └── /stop         POST: stop pipeline
+```
+
+The WebSocket sends a JSON packet every frame:
+```json
+{
+  "type": "frame",
+  "image": "<base64 JPEG>",
+  "tracks": [{"id": 3, "bbox": [x1,y1,x2,y2], "class": "pistol"}],
+  "alerts": [{"type": "WEAPON", "message": "Pistol detected!"}],
+  "fps": 55.2
+}
+```
+
+##### 3b. React Frontend (`frontend/`)
+
+```
+frontend/src/
+├── App.jsx                  ← Root layout
+├── components/
+│   ├── VideoFeed.jsx        ← Canvas with live WebSocket video + bounding boxes
+│   ├── AlertPanel.jsx       ← Real-time scrolling alert list (color-coded)
+│   ├── StatsBar.jsx         ← FPS counter, active tracks, total alerts
+│   └── ControlPanel.jsx     ← Source selector + threshold sliders + start/stop
+├── hooks/
+│   ├── useVideoStream.js    ← WebSocket connection + canvas draw logic
+│   └── useAlerts.js         ← Alert state management
+└── api/
+    └── sentinelApi.js       ← Axios calls to FastAPI endpoints
+```
+
+**UI Layout:**
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  ⚡ 55 FPS    👁 3 Tracks    🔴 2 Alerts    ⏱ 00:15:32  [LIVE] │
+├─────────────────────────────────┬────────────────────────────────┤
+│                                 │  🚨 ALERTS              [Clear]│
+│     LIVE VIDEO FEED             │  ──────────────────────────── │
+│     (WebSocket canvas)          │  🔴 WEAPON  Pistol!    12:34  │
+│                                 │  👥 CROWD   24 people  12:31  │
+│   ┌─ Person #3 ──────────────┐  │  🔴 WEAPON  Knife!     12:28  │
+│   │ Pistol #7 🔴 WEAPON ALERT│  │                               │
+│   └──────────────────────────┘  ├────────────────────────────────┤
+│                                 │  Source: [File][Webcam][RTSP]  │
+│                                 │  Confidence: ──●── 0.25        │
+│                                 │  Crowd Limit: ────●── 20       │
+│                                 │  [▶ START]      [⏹ STOP]      │
+└─────────────────────────────────┴────────────────────────────────┘
+```
+
+##### Run the full web app:
+```bash
+# Terminal 1 — Python backend
+uvicorn src.api:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 — React frontend
+cd frontend && npm run dev
+
+# Open: http://localhost:5173
+```
+
+---
+
+#### 📦 New Dependencies for All Phases
+
+```bash
+# Phase 2
+pip install supervision             # ByteTrack tracker
+
+# Phase 3 backend
+pip install fastapi "uvicorn[standard]" python-multipart
+
+# Phase 3 frontend (Node.js)
+cd frontend && npm install axios
+```
+
+---
+
+#### 🔮 Future (After Web App is Stable)
+
+| Feature | Description |
+|---------|-------------|
+| 🦴 Pose-based fight detection | YOLOv8-pose keypoints → detect aggression by arm angles |
+| 📐 Zone tripwires | Draw polygon zones — alert only when entered |
+| 🤖 LLM scene summary | Gemini/GPT-4V reads frame metadata → human-readable report |
+| 👮 Context suppression | Suppress weapon alert if police/security uniform detected |
+| 📷 Multi-camera grid | Run multiple feeds simultaneously in one dashboard |
