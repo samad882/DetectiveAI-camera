@@ -16,7 +16,12 @@ import math
 # Keyword lists to classify object names into categories
 PERSON_KEYWORDS = ["person", "people", "human"]
 BAG_KEYWORDS    = ["backpack", "handbag", "suitcase", "bag", "luggage"]
-WEAPON_KEYWORDS = ["firearm", "gun", "pistol", "knife", "weapon", "scissors", "rifle"]
+WEAPON_KEYWORDS = [
+    "firearm", "gun", "pistol", "knife", "weapon", "scissors",
+    "fight", "sword", "long sword", "short sword",
+    "ak", "ax", "cleaver", "cutter", "eto", "m16",
+    "revolver", "semi automatic", "shotgun", "spear", "rifle"
+]
 
 
 class RuleEngine:
@@ -47,11 +52,13 @@ class RuleEngine:
         # 📌 KEY CONCEPT: Multiple HashMaps for Per-Object State Tracking
         # Each dict is a separate 'track_id → state' mapping — this is the system's memory across frames
         # ── State memory across frames ────────────────────────────
-        self.bag_track_info           = {}  # tracks bag positions + timers
-        self.weapon_persist           = {}  # counts consecutive frames weapon seen
-        self.last_alert_time          = {"weapon": 0.0, "bag": 0.0, "crowd": 0.0}
-        self.track_frame_counts       = {}  # how many frames each track has been seen
-        self.last_weapon_alert_for_tid = {}  # per-track weapon alert cooldown
+        self.bag_track_info            = {}  # tracks bag positions + timers
+        self.weapon_persist             = {}  # counts consecutive frames weapon seen
+        self.last_alert_time            = {"weapon": 0.0, "bag": 0.0, "crowd": 0.0, "fight": 0.0}
+        self.track_frame_counts         = {}  # how many frames each track has been seen
+        self.last_weapon_alert_for_tid  = {}  # per-track weapon alert cooldown
+        # Fight proximity tracking: how many frames are 2+ persons overlapping
+        self.fight_proximity_counter    = 0
 
         # 📌 KEY CONCEPT: List Comprehension + any() for Keyword Matching
         # Auto-detects which rules to enable based on what class names the loaded model supports
@@ -229,5 +236,37 @@ class RuleEngine:
                         self.last_alert_time["weapon"] = now
                         self.last_weapon_alert_for_tid[tid] = now
 
-        # Returns: [{"type": "WEAPON", "message": "...", ...}, ...]
+
+        # ── RULE 4: PROXIMITY-BASED FIGHT DETECTION ──────────────────
+        # Model labels fighting persons as 'person' not 'fight' (training bias).
+        # Fallback: 2+ persons with overlapping boxes or centers < 120px for 8 frames = FIGHT alert.
+        if self.has_persons and len(persons_tracked) >= 2:
+            FIGHT_DIST_THRESHOLD   = 120
+            FIGHT_PROXIMITY_FRAMES = 8
+
+            person_list = list(persons_tracked.values())
+            close_pair_found = False
+            for i in range(len(person_list)):
+                for j in range(i + 1, len(person_list)):
+                    cx1, cy1 = person_list[i]["center"]
+                    cx2, cy2 = person_list[j]["center"]
+                    dist = math.hypot(cx1 - cx2, cy1 - cy2)
+                    b1 = person_list[i]["bbox"]; b2 = person_list[j]["bbox"]
+                    overlapping = (min(b1[2], b2[2]) > max(b1[0], b2[0])) and (min(b1[3], b2[3]) > max(b1[1], b2[1]))
+                    if dist < FIGHT_DIST_THRESHOLD or overlapping:
+                        close_pair_found = True
+                        break
+                if close_pair_found:
+                    break
+            if close_pair_found:
+                self.fight_proximity_counter += 1
+            else:
+                self.fight_proximity_counter = max(0, self.fight_proximity_counter - 2)
+            if self.fight_proximity_counter >= FIGHT_PROXIMITY_FRAMES:
+                if now - self.last_alert_time["fight"] >= 8.0:
+                    alerts.append({"type": "FIGHT", "message": f"Physical altercation! ({len(persons_tracked)} persons)", "timestamp": now, "frame_idx": frame_index})
+                    self.last_alert_time["fight"] = now
+        else:
+            self.fight_proximity_counter = max(0, self.fight_proximity_counter - 1)
+
         return alerts

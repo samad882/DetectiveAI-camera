@@ -43,8 +43,14 @@ class Detector:
         # Store class names: e.g. {0: "pistol", 1: "knife"}
         self.names = getattr(self.model, "names", None)
 
-        # Optional: rename class labels (not used currently)
-        self.class_remap = {}
+        # 📌 KEY CONCEPT: Clean up raw dataset class names
+        # Some Roboflow datasets have weird names like "0" or "BAGGAGE"
+        self.class_remap = {
+            "0": "fight",
+            "1": "person",
+            "baggage": "bag",
+            "handgun": "pistol"
+        }
 
         # 📌 KEY CONCEPT: Sliding Window List (Rolling Log)
         # Only the last 30 inference times are kept — old values removed with pop(0) to keep memory constant
@@ -133,6 +139,20 @@ class Detector:
                 # Optional rename (e.g. "guns" → "pistol")
                 if self.class_remap and name in self.class_remap:
                     name = self.class_remap[name]
+
+                # ── FIX B: Skip tiny boxes (shadows/noise create small boxes) ───
+                box_w = x2 - x1
+                box_h = y2 - y1
+                if box_w < 25 or box_h < 25:
+                    continue  # Too small = likely shadow or noise
+
+                # ── Per-class confidence: knife has dataset bias → needs slightly higher bar
+                # But never exceed user_conf+0.15 so slider still works
+                class_boost = {"knife": 0.12, "cutter": 0.12, "cleaver": 0.10}
+                boost = class_boost.get(name, 0.0)
+                min_conf = min(conf_threshold + boost, 0.80)
+                if conf < min_conf:
+                    continue  # Below per-class threshold → skip
 
                 # 📌 KEY CONCEPT: List of Tuples (Structured Output)
                 # Each detection is a tuple: (x1, y1, x2, y2, confidence, class_name) — fixed-width, fast to unpack

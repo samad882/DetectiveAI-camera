@@ -164,11 +164,11 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 
 
 # --- Config ---
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "best.onnx")
-CONF_THRESHOLD = 0.20
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "bestonnx.onnx")
+CONF_THRESHOLD = 0.40  # Raised from 0.20 → 0.40 to eliminate false detections
 CROWD_THRESHOLD = 20
 BAG_STATIONARY_SECONDS = 5
-WEAPON_PERSIST_FRAMES = 3
+WEAPON_PERSIST_FRAMES = 2  # Low FPS (3-10) pe 2 frames kaafi — zyada rakhne par alerts miss hote hain
 
 # --- Header ---
 st.markdown("""
@@ -208,6 +208,8 @@ elif source_type == "Webcam":
 
 st.sidebar.markdown('<div class="sidebar-section" style="margin-top:20px;">Controls</div>', unsafe_allow_html=True)
 
+user_conf = st.sidebar.slider("Confidence Threshold", 0.10, 0.95, 0.25, 0.05, help="Increase this if you see wrong/fake detections")
+
 if "running" not in st.session_state:
     st.session_state.running = False
 
@@ -217,8 +219,8 @@ if st.sidebar.button("⏹  Stop", use_container_width=True):
     st.session_state.running = False
 
 st.sidebar.divider()
-st.sidebar.caption("Model: `best.onnx` · Classes: pistol, knife")
-st.sidebar.caption("Threshold: 0.20 · Persist: 3 frames")
+st.sidebar.caption("Model: `bestonnx.onnx` · Classes: pistol, knife")
+st.sidebar.caption(f"Persist: {WEAPON_PERSIST_FRAMES} frames")
 
 # --- Main Layout ---
 col_video, col_panel = st.columns([3, 1], gap="large")
@@ -251,13 +253,49 @@ if not st.session_state.running:
         <div class="stat-row"><span class="stat-label">FPS</span><span class="stat-value">—</span></div>
         <div class="stat-row"><span class="stat-label">Tracks</span><span class="stat-value">—</span></div>
         """, unsafe_allow_html=True)
-        alert_placeholder.markdown('<span style="font-size:13px; color:#9ca3af;">No alerts yet.</span>', unsafe_allow_html=True)
+import logging
+import queue
+import threading
+from collections import deque
 
-# --- Processing Loop ---
+# ── Production logger (replaces print statements) ───────────────
+logger = logging.getLogger("SentinelAI")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S"
+)
+
+# ── Model warmup helper ──────────────────────────────────────────
+def warmup_model(detector, img_size=320):
+    """Run 2 dummy frames through model so first real frame is fast."""
+    import numpy as np
+    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    for _ in range(2):
+        detector.detect(dummy, conf_threshold=0.5, img_size=img_size)
+    logger.info("Model warmup complete.")
+
+
+# --- Processing Loop (Production-grade) ---
 if st.session_state.running and video_path is not None:
+
+    # ── Initialize pipeline ──────────────────────────────────────
     try:
         detector = load_model(MODEL_PATH)
-        model_classes = list(detector.names.values()) if detector.names else []
+
+        # Apply remap BEFORE passing to RuleEngine
+        raw_classes = list(detector.names.values()) if detector.names else []
+        model_classes = []
+        for c in raw_classes:
+            c_lower = c.lower()
+            remapped = detector.class_remap.get(c_lower, c_lower)
+            model_classes.append(remapped)
+
+        logger.info(f"Model loaded. Classes: {model_classes}")
+
+        # Warmup: prevents first-frame latency spike
+        warmup_model(detector, img_size=320)
+
         tracker = Tracker()
         rules = RuleEngine(
             crowd_threshold=CROWD_THRESHOLD,
@@ -265,86 +303,160 @@ if st.session_state.running and video_path is not None:
             weapon_persist_frames=WEAPON_PERSIST_FRAMES,
             model_classes=model_classes
         )
+        logger.info(f"RuleEngine: persons={rules.has_persons}, bags={rules.has_bags}, weapons={rules.has_weapons}")
+
     except Exception as e:
+        logger.error(f"Pipeline init failed: {e}")
         st.error(f"Failed to initialize: {e}")
         st.stop()
 
     cap = cv2.VideoCapture(video_path)
-
     if not cap.isOpened():
         st.error("Could not open video source.")
     else:
-        frame_idx = 0
+        # ── Shared state (thread-safe) ───────────────────────────
+        frame_queue   = queue.Queue(maxsize=4)
+        result_store  = {"tracks": [], "alerts": [], "latency": "—"}
+        stop_event    = threading.Event()
+
+        # Get native video FPS for throttling
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_delay = 1.0 / native_fps  # e.g. 25 FPS → sleep 0.04s between frames
+        logger.info(f"Video native FPS: {native_fps:.1f} → frame_delay={frame_delay*1000:.0f}ms")
+
+        fps_history   = deque(maxlen=15)
         alert_history = []
+        frame_idx     = 0
+
+        # ── INFERENCE THREAD ─────────────────────────────────────
+        # Production pattern: runs AI in background, never blocks display
+        def inference_worker():
+            """
+            Background thread: dequeues frames → runs AI → stores results.
+            This is the standard CCTV AI pipeline pattern:
+              - Decoupled from display thread
+              - AI runs at its natural speed (6-7 FPS on Mac CPU)
+              - Display runs at full capture speed
+            """
+            local_frame_idx = 0
+            while not stop_event.is_set():
+                try:
+                    frame = frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                local_frame_idx += 1
+
+                try:
+                    dets    = detector.detect(frame, conf_threshold=user_conf, img_size=320)
+                    tracks  = tracker.update(dets, frame)
+                    alerts  = rules.process(tracks, local_frame_idx, frame_timestamp=time.time())
+
+                    result_store["tracks"]  = tracks
+                    result_store["alerts"]  = alerts
+                    result_store["latency"] = detector.latency_stats().get("avg_ms", "—")
+
+                    if alerts:
+                        logger.warning(f"ALERT frame={local_frame_idx}: {[a['type'] for a in alerts]}")
+                    if dets:
+                        logger.info(f"DETECT frame={local_frame_idx}: {[(d[5], round(d[4],2)) for d in dets]}")
+
+                except Exception as e:
+                    logger.error(f"Inference error: {e}")
+
+                frame_queue.task_done()
+
+        # Start inference thread
+        inf_thread = threading.Thread(target=inference_worker, daemon=True)
+        inf_thread.start()
+        logger.info("Inference thread started.")
+
+        # ── CAPTURE + DISPLAY LOOP (Main thread) ─────────────────
         prev_time = time.time()
+        frame_timer = time.time()  # For throttling to video speed
 
-        while cap.isOpened() and st.session_state.running:
-            ret, frame = cap.read()
-            if not ret:
-                st.info("Video finished.")
-                break
+        try:
+            while cap.isOpened() and st.session_state.running:
+                ret, frame = cap.read()
+                if not ret:
+                    st.info("Video finished.")
+                    break
 
-            frame_idx += 1
-            curr_time = time.time()
-            fps = 1.0 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 30.0
-            prev_time = curr_time
+                frame_idx += 1
 
-            # Detection → Tracking → Rules
-            detections = detector.detect(frame, conf_threshold=CONF_THRESHOLD)
-            tracks = tracker.update(detections, frame)
-            current_alerts = rules.process(tracks, frame_idx, frame_timestamp=time.time())
+                # ── THROTTLE to video's native FPS ───────────────────
+                # Without this, display runs at 200+ FPS consuming frames instantly
+                elapsed_since_last = time.time() - frame_timer
+                sleep_needed = frame_delay - elapsed_since_last
+                if sleep_needed > 0:
+                    time.sleep(sleep_needed)
+                frame_timer = time.time()
 
-            # Update alert history
-            for alert in current_alerts:
-                alert_history.insert(0, {
-                    "time": time.strftime('%H:%M:%S'),
-                    "type": alert["type"],
-                    "msg": alert["message"]
-                })
-            alert_history = alert_history[:15]
+                # Push frame to inference queue (non-blocking drop)
+                if not frame_queue.full():
+                    frame_queue.put(frame.copy())
 
-            # Draw overlays
-            frame = draw_tracks(frame, tracks)
-            frame = draw_alerts(frame, current_alerts)
-            display_frame = cv2.resize(frame, (640, 360))
-            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                # FPS: rolling average (smooth display)
+                now = time.time()
+                elapsed = now - prev_time
+                prev_time = now
+                if elapsed > 0:
+                    fps_history.append(1.0 / elapsed)
+                fps = sum(fps_history) / len(fps_history) if fps_history else 0.0
 
-            # Update video
-            video_placeholder.image(frame_rgb, channels="RGB", width="stretch")
+                # Get latest AI results (non-blocking — use last known result)
+                tracks  = result_store["tracks"]
+                alerts  = result_store["alerts"]
+                lat_str = f"{result_store['latency']} ms" if result_store['latency'] != '—' else "—"
 
-            # Update status panel
-            latency = detector.latency_stats()
-            lat_str = f"{latency['avg_ms']} ms" if latency['avg_ms'] else "—"
-            status_placeholder.markdown(f"""
-            <div class="stat-row"><span class="stat-label">Status</span><span class="badge-running">Running</span></div>
-            <div class="stat-row"><span class="stat-label">Frame</span><span class="stat-value">{frame_idx}</span></div>
-            <div class="stat-row"><span class="stat-label">FPS</span><span class="stat-value">{fps:.1f}</span></div>
-            <div class="stat-row"><span class="stat-label">Inference</span><span class="stat-value">{lat_str}</span></div>
-            <div class="stat-row"><span class="stat-label">Active Tracks</span><span class="stat-value">{len(tracks)}</span></div>
-            """, unsafe_allow_html=True)
+                # Accumulate alert history
+                for alert in alerts:
+                    result_store["alerts"] = []  # consume alerts
+                    alert_history.insert(0, {
+                        "time": time.strftime('%H:%M:%S'),
+                        "type": alert["type"],
+                        "msg":  alert["message"]
+                    })
+                alert_history = alert_history[:20]
 
-            # Update alert log
-            if alert_history:
-                cards = ""
-                for a in alert_history[:8]:
-                    cards += f"""
-                    <div class="alert-card">
-                        <div class="alert-card-time">{a['time']} · {a['type']}</div>
-                        <div class="alert-card-text">{a['msg']}</div>
-                    </div>"""
-                alert_placeholder.markdown(cards, unsafe_allow_html=True)
-            else:
-                alert_placeholder.markdown('<span style="font-size:13px; color:#9ca3af;">No alerts yet.</span>', unsafe_allow_html=True)
+                # Draw overlays + display
+                frame = draw_tracks(frame, tracks)
+                frame = draw_alerts(frame, alerts)
+                display_frame = cv2.resize(frame, (640, 360))
+                frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                video_placeholder.image(frame_rgb, channels="RGB", width="stretch")
 
-            # FPS cap
-            process_time = time.time() - curr_time
-            sleep_time = (1.0 / 30.0) - process_time
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Status panel
+                active = len([t for t in tracks if t.is_confirmed()])
+                status_placeholder.markdown(f"""
+                <div class="stat-row"><span class="stat-label">Status</span><span class="badge-running">Running</span></div>
+                <div class="stat-row"><span class="stat-label">Frame</span><span class="stat-value">{frame_idx}</span></div>
+                <div class="stat-row"><span class="stat-label">Display FPS</span><span class="stat-value">{fps:.1f}</span></div>
+                <div class="stat-row"><span class="stat-label">AI Latency</span><span class="stat-value">{lat_str}</span></div>
+                <div class="stat-row"><span class="stat-label">Active Tracks</span><span class="stat-value">{active}</span></div>
+                """, unsafe_allow_html=True)
 
-    cap.release()
-    if source_type == "Upload Video" and video_path:
-        os.remove(video_path)
+                # Alert log
+                if alert_history:
+                    cards = ""
+                    for a in alert_history[:8]:
+                        cards += f"""
+                        <div class="alert-card">
+                            <div class="alert-card-time">{a['time']} · {a['type']}</div>
+                            <div class="alert-card-text">{a['msg']}</div>
+                        </div>"""
+                    alert_placeholder.markdown(cards, unsafe_allow_html=True)
+                else:
+                    alert_placeholder.markdown('<span style="font-size:13px; color:#9ca3af;">No alerts yet.</span>', unsafe_allow_html=True)
+
+        finally:
+            # Graceful shutdown: signal thread to stop, wait for it
+            stop_event.set()
+            inf_thread.join(timeout=2.0)
+            cap.release()
+            logger.info("Pipeline shutdown complete.")
+            if source_type == "Upload Video" and video_path and os.path.exists(video_path):
+                os.remove(video_path)
 
 elif st.session_state.running and video_path is None:
     st.error("Please select a video source first.")
