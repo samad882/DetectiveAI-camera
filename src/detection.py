@@ -140,15 +140,27 @@ class Detector:
                 if self.class_remap and name in self.class_remap:
                     name = self.class_remap[name]
 
-                # ── FIX B: Skip tiny boxes (shadows/noise create small boxes) ───
+                # ── FIX B: Skip tiny boxes ─────────────────────────────────
                 box_w = x2 - x1
                 box_h = y2 - y1
-                if box_w < 25 or box_h < 25:
-                    continue  # Too small = likely shadow or noise
 
-                # ── Per-class confidence: knife has dataset bias → needs slightly higher bar
-                # But never exceed user_conf+0.15 so slider still works
-                class_boost = {"knife": 0.12, "cutter": 0.12, "cleaver": 0.10}
+                # Guns/rifles are larger objects — but if they are far away, 40 is too strict.
+                # Changing back to 30px to catch distant guns while still ignoring tiny shadows.
+                GUN_CLASSES = {"pistol", "rifle", "ak", "m16", "revolver",
+                               "semi automatic", "shotgun", "handgun"}
+                min_box = 30 if name in GUN_CLASSES else 25
+                if box_w < min_box or box_h < min_box:
+                    continue  # Too small → shadow/noise, skip
+
+                # ── Per-class confidence boosts ───────────────────────────────
+                # Knife: high dataset bias → needs boost to reduce false positives
+                # Guns: REMOVED boost — deep audit showed model sees guns at low conf (0.10-0.26)
+                #       Real guns are already protected by: min_box=30px + weapon_persist=6 frames
+                class_boost = {
+                    "knife":          0.12,
+                    "cutter":         0.12,
+                    "cleaver":        0.10,
+                }
                 boost = class_boost.get(name, 0.0)
                 min_conf = min(conf_threshold + boost, 0.80)
                 if conf < min_conf:

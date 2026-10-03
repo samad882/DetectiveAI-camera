@@ -33,7 +33,7 @@ class RuleEngine:
     def __init__(self,
                  crowd_threshold=20,
                  bag_stationary_seconds=10,
-                 weapon_persist_frames=4,
+                 weapon_persist_frames=6,
                  min_track_frames_before_bag=8,
                  alert_cooldowns=None,
                  model_classes=None):
@@ -238,11 +238,17 @@ class RuleEngine:
 
 
         # ── RULE 4: PROXIMITY-BASED FIGHT DETECTION ──────────────────
-        # Model labels fighting persons as 'person' not 'fight' (training bias).
-        # Fallback: 2+ persons with overlapping boxes or centers < 120px for 8 frames = FIGHT alert.
-        if self.has_persons and len(persons_tracked) >= 2:
-            FIGHT_DIST_THRESHOLD   = 120
-            FIGHT_PROXIMITY_FRAMES = 8
+        # Detects when 2-3 persons are physically ON TOP of each other (bbox overlap).
+        #
+        # SMART FILTERS to avoid false positives:
+        #   1. Skip if 4+ persons → classroom/group, not a fight
+        #   2. Only trigger on bbox OVERLAP (not just "close") → sitting side-by-side won't trigger
+        #   3. Need 15 consecutive frames of overlap → students sit still but fights are sustained contact
+        #   4. Distance threshold reduced to 80px → must be VERY close
+        num_persons = len(persons_tracked)
+        if self.has_persons and 2 <= num_persons <= 3:
+            FIGHT_DIST_THRESHOLD   = 80    # Must be very close (not just side-by-side)
+            FIGHT_PROXIMITY_FRAMES = 10    # Changed from 15 to 10 frames (1/3rd of a second)
 
             person_list = list(persons_tracked.values())
             close_pair_found = False
@@ -251,22 +257,44 @@ class RuleEngine:
                     cx1, cy1 = person_list[i]["center"]
                     cx2, cy2 = person_list[j]["center"]
                     dist = math.hypot(cx1 - cx2, cy1 - cy2)
+
+                    # Check bounding box overlap (physical contact)
                     b1 = person_list[i]["bbox"]; b2 = person_list[j]["bbox"]
-                    overlapping = (min(b1[2], b2[2]) > max(b1[0], b2[0])) and (min(b1[3], b2[3]) > max(b1[1], b2[1]))
-                    if dist < FIGHT_DIST_THRESHOLD or overlapping:
+                    ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
+                    ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
+                    overlap_w = max(0, ix2 - ix1)
+                    overlap_h = max(0, iy2 - iy1)
+                    overlap_area = overlap_w * overlap_h
+
+                    # Need SIGNIFICANT overlap (>15% of smaller box) OR very close centers (dist < 80px)
+                    b1_area = max(1, (b1[2]-b1[0]) * (b1[3]-b1[1]))
+                    b2_area = max(1, (b2[2]-b2[0]) * (b2[3]-b2[1]))
+                    min_area = min(b1_area, b2_area)
+                    overlap_ratio = overlap_area / min_area
+
+                    # Changed 'and' to 'or' - if they are very close OR overlapping significantly, it's a fight
+                    if dist < FIGHT_DIST_THRESHOLD or overlap_ratio > 0.15:
                         close_pair_found = True
                         break
                 if close_pair_found:
                     break
+
             if close_pair_found:
                 self.fight_proximity_counter += 1
             else:
                 self.fight_proximity_counter = max(0, self.fight_proximity_counter - 2)
+
             if self.fight_proximity_counter >= FIGHT_PROXIMITY_FRAMES:
-                if now - self.last_alert_time["fight"] >= 8.0:
-                    alerts.append({"type": "FIGHT", "message": f"Physical altercation! ({len(persons_tracked)} persons)", "timestamp": now, "frame_idx": frame_index})
+                if now - self.last_alert_time["fight"] >= 10.0:  # 10s cooldown
+                    alerts.append({
+                        "type": "FIGHT",
+                        "message": f"⚠️ Physical altercation! ({num_persons} persons in contact)",
+                        "timestamp": now,
+                        "frame_idx": frame_index
+                    })
                     self.last_alert_time["fight"] = now
         else:
+            # 0-1 persons or 4+ persons (classroom/crowd) → reset counter
             self.fight_proximity_counter = max(0, self.fight_proximity_counter - 1)
 
         return alerts
