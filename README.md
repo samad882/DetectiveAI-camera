@@ -1,4 +1,4 @@
-# 🛡️ SentinelAI
+# 🛡️ DetectiveAI
 ### *AI-Powered Real-Time Surveillance Intelligence*
 
 > **Turning dumb cameras into smart security systems — detecting threats before they escalate.**
@@ -30,12 +30,12 @@ The rest are just recording — not watching.
 
 ## 📑 Slide 2 — Our Solution
 
-**SentinelAI is a software layer that makes any existing CCTV camera intelligent.**
+**DetectiveAI is a software layer that makes any existing CCTV camera intelligent.**
 
 No new cameras needed. No hardware upgrades. Just plug in the AI.
 
 ```
-Existing Camera  →  SentinelAI AI Engine  →  Instant Alert + Live Dashboard
+Existing Camera  →  DetectiveAI AI Engine  →  Instant Alert + Live Dashboard
 ```
 
 | What We Do | How |
@@ -66,7 +66,7 @@ Existing Camera  →  SentinelAI AI Engine  →  Instant Alert + Live Dashboard
 
 ## 📑 Slide 4 — Use Cases
 
-| Scenario | SentinelAI Response |
+| Scenario | DetectiveAI Response |
 |----------|-------------------|
 | 🔫 Someone pulls out a weapon in a corridor | Alert fires within 100ms to security team |
 | 🥊 Two people start fighting on campus | Detected within seconds of physical contact |
@@ -96,7 +96,7 @@ Existing Camera  →  SentinelAI AI Engine  →  Instant Alert + Live Dashboard
 
 ## 📑 Slide 6 — Tech Stack
 
-| Technology | What It Does in SentinelAI |
+| Technology | What It Does in DetectiveAI |
 |---|---|
 | **YOLOv11m** | Core AI model — detects guns, people, bags, knives per frame |
 | **ONNX Runtime** | Runs the model in production — fast, lightweight, hardware-agnostic |
@@ -153,6 +153,6 @@ Open **`http://localhost:8501`**
 
 **Built to make every camera smarter. Built for a safer world.**
 
-*SentinelAI — See Everything. Miss Nothing.*
+*DetectiveAI — See Everything. Miss Nothing.*
 
 </div>
