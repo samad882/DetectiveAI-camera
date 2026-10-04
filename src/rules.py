@@ -14,13 +14,14 @@ import math
 # └──────────────────────────────────────────────────────────────────┘
 
 # Keyword lists to classify object names into categories
-PERSON_KEYWORDS = ["person", "people", "human"]
-BAG_KEYWORDS    = ["backpack", "handbag", "suitcase", "bag", "luggage"]
+PERSON_KEYWORDS = ["person", "people", "human", "man"]
+BAG_KEYWORDS    = ["backpack", "handbag", "suitcase", "bag", "luggage", "baggage"]
 WEAPON_KEYWORDS = [
     "firearm", "gun", "pistol", "knife", "weapon", "scissors",
     "fight", "sword", "long sword", "short sword",
     "ak", "ax", "cleaver", "cutter", "eto", "m16",
-    "revolver", "semi automatic", "shotgun", "spear", "rifle"
+    "revolver", "semi automatic", "shotgun", "spear", "rifle",
+    "armed", "handgun", "multiknife", "person with a gun"
 ]
 
 
@@ -59,6 +60,10 @@ class RuleEngine:
         self.last_weapon_alert_for_tid  = {}  # per-track weapon alert cooldown
         # Fight proximity tracking: how many frames are 2+ persons overlapping
         self.fight_proximity_counter    = 0
+        # 📌 KEY CONCEPT: Position History for Velocity Calculation
+        # Stores last N positions per track_id so we can compute speed (pixels/frame)
+        self.person_pos_history         = {}  # {tid: [(cx, cy), ...]} last 8 positions
+        self.pair_dist_history          = {}  # {(tid1,tid2): [dist, ...]} last 8 distances
 
         # 📌 KEY CONCEPT: List Comprehension + any() for Keyword Matching
         # Auto-detects which rules to enable based on what class names the loaded model supports
@@ -73,11 +78,13 @@ class RuleEngine:
     # │  Maps a class name string → category (person / bag / weapon)     │
     # └──────────────────────────────────────────────────────────────────┘
     def _classify(self, name):
-        # 📌 KEY CONCEPT: Short-circuit Evaluation with any()
-        # any() stops at the first match — O(N) worst case but fast in practice for small keyword lists
-        if any(k in name for k in PERSON_KEYWORDS): return "person"
-        if any(k in name for k in BAG_KEYWORDS):    return "bag"
-        if any(k in name for k in WEAPON_KEYWORDS): return "weapon"
+        # 📌 KEY CONCEPT: Case-insensitive classification
+        # Lowercase name so 'HandGun', 'BAGGAGE', 'Armed Man' all match correctly
+        n = name.lower()
+        # ⚠️ Check WEAPON first — 'person with a gun' should be WEAPON not PERSON
+        if any(k in n for k in WEAPON_KEYWORDS): return "weapon"
+        if any(k in n for k in BAG_KEYWORDS):    return "bag"
+        if any(k in n for k in PERSON_KEYWORDS): return "person"
         return None
 
     # ┌──────────────────────────────────────────────────────────────────┐
@@ -140,6 +147,7 @@ class RuleEngine:
                 self.bag_track_info.pop(tid, None)
                 self.weapon_persist.pop(tid, None)
                 self.last_weapon_alert_for_tid.pop(tid, None)
+                self.person_pos_history.pop(tid, None)  # Clean up motion history
 
         # ── RULE 1: CROWD ────────────────────────────────────────────
         # Only runs if model can detect persons
@@ -212,6 +220,15 @@ class RuleEngine:
         # Only runs if model can detect weapons
         if self.has_weapons:
             for tid, winfo in weapon_candidates.items():
+                
+                # 📌 KEY CONCEPT: Contextual Filtering (Fight state suppresses noisy classes)
+                # "armed man" is notoriously noisy during physical fights.
+                # If a fight has been detected recently, we ignore "armed man" alerts.
+                # (But explicit classes like "gun" or "knife" will still trigger!)
+                is_fight_active = (now - self.last_alert_time.get("fight", 0.0)) < 15.0
+                if is_fight_active and winfo["name"] in ("armed man", "person with a gun"):
+                    continue
+
                 # 📌 KEY CONCEPT: Per-Track Consecutive Frame Counter (Temporal Persistence Filter)
                 # A weapon must appear for N consecutive frames before alerting — filters single-frame noise
                 # Count consecutive frames this weapon track has been seen
@@ -227,9 +244,10 @@ class RuleEngine:
                     last_tid_time = self.last_weapon_alert_for_tid.get(tid, 0.0)
                     if (now - last_tid_time >= self.alert_cooldowns["weapon"] and
                             now - self.last_alert_time["weapon"] >= self.alert_cooldowns["weapon"]):
+                        weapon_display_name = winfo["name"].title()
                         alerts.append({
-                            "type": "WEAPON",
-                            "message": f"Weapon ({winfo['name']}) detected!",
+                            "type": f"THREAT: {weapon_display_name}",
+                            "message": f"Weapon detected!",
                             "timestamp": now, "frame_idx": frame_index,
                             "bbox": winfo["bbox"], "track_id": tid
                         })
@@ -237,64 +255,115 @@ class RuleEngine:
                         self.last_weapon_alert_for_tid[tid] = now
 
 
-        # ── RULE 4: PROXIMITY-BASED FIGHT DETECTION ──────────────────
-        # Detects when 2-3 persons are physically ON TOP of each other (bbox overlap).
-        #
-        # SMART FILTERS to avoid false positives:
-        #   1. Skip if 4+ persons → classroom/group, not a fight
-        #   2. Only trigger on bbox OVERLAP (not just "close") → sitting side-by-side won't trigger
-        #   3. Need 15 consecutive frames of overlap → students sit still but fights are sustained contact
-        #   4. Distance threshold reduced to 80px → must be VERY close
+        # ── RULE 4: SMART FIGHT DETECTION (Proximity + Motion) ───────
+        # Real fights have 3 signatures:
+        #   A. People are CLOSE (overlap or dist < threshold)
+        #   B. At least one person is moving FAST (velocity > threshold) — friends talking are still!
+        #   C. OR pair distance is RAPIDLY DECREASING (sudden approach)
+        # All 3 conditions prevent false positives from groups standing/talking.
         num_persons = len(persons_tracked)
-        if self.has_persons and 2 <= num_persons <= 3:
-            FIGHT_DIST_THRESHOLD   = 80    # Must be very close (not just side-by-side)
-            FIGHT_PROXIMITY_FRAMES = 10    # Changed from 15 to 10 frames (1/3rd of a second)
+        if self.has_persons and 2 <= num_persons <= 6:
+            FIGHT_DIST_THRESHOLD   = 120   # px — close proximity
+            FIGHT_PROXIMITY_FRAMES = 8     # consecutive frames needed
+            MIN_VELOCITY           = 6.0   # px/frame — below this = person is standing still
+            MIN_APPROACH_SPEED     = 4.0   # px/frame — pairs closing in fast
+            HISTORY_LEN            = 8     # frames to keep in history
 
-            person_list = list(persons_tracked.values())
-            close_pair_found = False
+            # ── Update position history for each tracked person ──
+            person_ids   = list(persons_tracked.keys())
+            person_list  = list(persons_tracked.values())
+
+            for tid, info in persons_tracked.items():
+                cx, cy = info["center"]
+                hist = self.person_pos_history.get(tid, [])
+                hist.append((cx, cy))
+                self.person_pos_history[tid] = hist[-HISTORY_LEN:]  # keep last N
+
+            # ── Compute per-person velocity (avg speed over last frames) ──
+            def _velocity(tid):
+                hist = self.person_pos_history.get(tid, [])
+                if len(hist) < 2:
+                    return 0.0
+                speeds = [math.hypot(hist[i][0]-hist[i-1][0], hist[i][1]-hist[i-1][1])
+                          for i in range(1, len(hist))]
+                return sum(speeds) / len(speeds)
+
+            # ── Compute approach speed between a pair ──
+            def _approach_speed(tid1, tid2):
+                key = (min(tid1,tid2), max(tid1,tid2))
+                h1 = self.person_pos_history.get(tid1, [])
+                h2 = self.person_pos_history.get(tid2, [])
+                n  = min(len(h1), len(h2))
+                if n < 3:
+                    return 0.0
+                dists = [math.hypot(h1[-(n-i)][0]-h2[-(n-i)][0],
+                                    h1[-(n-i)][1]-h2[-(n-i)][1])
+                         for i in range(n)]
+                # Positive = getting closer, negative = moving apart
+                return (dists[0] - dists[-1]) / max(1, n - 1)
+
+            close_pair_found   = False
+            motion_detected    = False
+
             for i in range(len(person_list)):
                 for j in range(i + 1, len(person_list)):
                     cx1, cy1 = person_list[i]["center"]
                     cx2, cy2 = person_list[j]["center"]
                     dist = math.hypot(cx1 - cx2, cy1 - cy2)
 
-                    # Check bounding box overlap (physical contact)
+                    # Bounding box overlap check
                     b1 = person_list[i]["bbox"]; b2 = person_list[j]["bbox"]
                     ix1 = max(b1[0], b2[0]); iy1 = max(b1[1], b2[1])
                     ix2 = min(b1[2], b2[2]); iy2 = min(b1[3], b2[3])
-                    overlap_w = max(0, ix2 - ix1)
-                    overlap_h = max(0, iy2 - iy1)
-                    overlap_area = overlap_w * overlap_h
-
-                    # Need SIGNIFICANT overlap (>15% of smaller box) OR very close centers (dist < 80px)
-                    b1_area = max(1, (b1[2]-b1[0]) * (b1[3]-b1[1]))
-                    b2_area = max(1, (b2[2]-b2[0]) * (b2[3]-b2[1]))
-                    min_area = min(b1_area, b2_area)
+                    overlap_area = max(0, ix2-ix1) * max(0, iy2-iy1)
+                    min_area = min(
+                        max(1, (b1[2]-b1[0])*(b1[3]-b1[1])),
+                        max(1, (b2[2]-b2[0])*(b2[3]-b2[1]))
+                    )
                     overlap_ratio = overlap_area / min_area
 
-                    # Changed 'and' to 'or' - if they are very close OR overlapping significantly, it's a fight
-                    if dist < FIGHT_DIST_THRESHOLD or overlap_ratio > 0.15:
-                        close_pair_found = True
-                        break
+                    # Condition A: Are they close/overlapping?
+                    pair_close = (dist < FIGHT_DIST_THRESHOLD or overlap_ratio > 0.10)
+
+                    if pair_close:
+                        tid1 = person_ids[i]
+                        tid2 = person_ids[j]
+
+                        # Condition B: Is anyone moving fast? (not just standing)
+                        v1 = _velocity(tid1)
+                        v2 = _velocity(tid2)
+                        any_motion = (v1 > MIN_VELOCITY or v2 > MIN_VELOCITY)
+
+                        # Condition C: Are they rapidly approaching each other?
+                        approach = _approach_speed(tid1, tid2)
+                        rapid_approach = approach > MIN_APPROACH_SPEED
+
+                        # Fight = close + (motion OR rapid approach)
+                        if any_motion or rapid_approach:
+                            close_pair_found = True
+                            motion_detected  = True
+                            break
+
                 if close_pair_found:
                     break
 
-            if close_pair_found:
+            if close_pair_found and motion_detected:
                 self.fight_proximity_counter += 1
             else:
+                # Decay counter faster if no motion (was just static proximity)
                 self.fight_proximity_counter = max(0, self.fight_proximity_counter - 2)
 
             if self.fight_proximity_counter >= FIGHT_PROXIMITY_FRAMES:
                 if now - self.last_alert_time["fight"] >= 10.0:  # 10s cooldown
                     alerts.append({
                         "type": "FIGHT",
-                        "message": f"⚠️ Physical altercation! ({num_persons} persons in contact)",
+                        "message": f"⚠️ Physical altercation! ({num_persons} persons in contact + motion)",
                         "timestamp": now,
                         "frame_idx": frame_index
                     })
                     self.last_alert_time["fight"] = now
         else:
-            # 0-1 persons or 4+ persons (classroom/crowd) → reset counter
+            # 0-1 persons or 7+ persons → reset counter
             self.fight_proximity_counter = max(0, self.fight_proximity_counter - 1)
 
         return alerts

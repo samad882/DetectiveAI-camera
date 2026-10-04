@@ -19,33 +19,49 @@ import time
 # │  Output: frame with boxes drawn on it                            │
 # └──────────────────────────────────────────────────────────────────┘
 def draw_tracks(frame, tracks):
-    # 📌 KEY CONCEPT: Defensive Copy (frame.copy())
-    # We draw on a copy, not the original frame — prevents side-effects if the frame is reused elsewhere
     out = frame.copy()
 
     for t in tracks:
         try:
-            # Get [x1, y1, x2, y2] bounding box
             ltrb = t.to_ltrb()
             x1, y1, x2, y2 = [int(v) for v in ltrb]
-
-            # Get track ID and class name
             tid  = getattr(t, "track_id", None)
             name = t.get_det_class() if hasattr(t, "get_det_class") else "obj"
+            name_lower = name.lower()
 
-            # 📌 KEY CONCEPT: OpenCV Drawing API (Mutable In-Place Operations)
-            # cv2.rectangle and cv2.putText modify the numpy array in place — very fast, no new allocations
-            # Draw the box (yellow colour)
-            cv2.rectangle(out, (x1, y1), (x2, y2), (255, 200, 0), 2)
+            # ── PROFESSIONAL CLEAN COLOR CODING ──
+            # Weapon: Red (0, 0, 239) in BGR
+            # Person: Blue (235, 99, 37) in BGR (Tailwind blue-600)
+            # Bag/Other: Purple (182, 36, 139) in BGR
+            if "gun" in name_lower or "armed" in name_lower or "knife" in name_lower or "sword" in name_lower or "ax" in name_lower:
+                color = (40, 40, 239) # Red (BGR)
+                txt_color = (255, 255, 255)
+            elif "person" in name_lower or "man" in name_lower:
+                color = (235, 99, 37) # Blue (BGR)
+                txt_color = (255, 255, 255)
+            else:
+                color = (182, 36, 139) # Purple (BGR)
+                txt_color = (255, 255, 255)
 
-            # Draw label above the box
-            label = f"ID:{tid} {name}"
-            cv2.putText(out, label, (x1, max(10, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+            # Draw clean thin bounding box
+            thickness = 2
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+
+            # ── DRAW CLEAN LABEL BACKGROUND & TEXT ──
+            label = f"{name.title()} #{tid}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, 1)
+
+            # Label box background (solid color, no transparency)
+            cv2.rectangle(out, (x1, y1 - text_h - 6), (x1 + text_w + 4, y1), color, -1)
+            
+            # Label text
+            cv2.putText(out, label, (x1 + 2, y1 - 3), font, font_scale, txt_color, 1, cv2.LINE_AA)
 
         except Exception:
-            pass  # Skip this track if any value is missing/invalid
-
+            pass 
+            
     return out
 
 

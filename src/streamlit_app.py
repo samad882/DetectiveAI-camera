@@ -208,8 +208,7 @@ elif source_type == "Webcam":
 
 st.sidebar.markdown('<div class="sidebar-section" style="margin-top:20px;">Controls</div>', unsafe_allow_html=True)
 
-user_conf = st.sidebar.slider("Confidence Threshold", 0.10, 0.95, 0.25, 0.05, help="Increase this if you see wrong/fake detections")
-
+# Removed confidence slider for a zero-config experience. Using CONF_THRESHOLD backend setting.
 if "running" not in st.session_state:
     st.session_state.running = False
 
@@ -348,7 +347,7 @@ if st.session_state.running and video_path is not None:
                 local_frame_idx += 1
 
                 try:
-                    dets    = detector.detect(frame, conf_threshold=user_conf, img_size=320)
+                    dets    = detector.detect(frame, conf_threshold=CONF_THRESHOLD, img_size=320)
                     tracks  = tracker.update(dets, frame)
                     alerts  = rules.process(tracks, local_frame_idx, frame_timestamp=time.time())
 

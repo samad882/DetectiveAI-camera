@@ -44,12 +44,37 @@ class Detector:
         self.names = getattr(self.model, "names", None)
 
         # 📌 KEY CONCEPT: Clean up raw dataset class names
-        # Some Roboflow datasets have weird names like "0" or "BAGGAGE"
+        # Some Roboflow datasets have weird names like "0" or "1" for class IDs
         self.class_remap = {
-            "0": "fight",
+            # Normalize dataset overlap for persons
+            "0": "armed man", 
             "1": "person",
-            "baggage": "bag",
-            "handgun": "pistol"
+            "man": "person",
+            
+            # Normalize dataset overlap for guns
+            "handgun": "gun",
+            "handgunth": "gun",
+            "revolver": "gun",
+            "semi automatic": "gun",
+            "ak": "gun",
+            "m16": "gun",
+            "rifle": "gun",
+            "shotgun": "gun",
+            "shotgunth": "gun",
+            
+            # Normalize dataset overlap for blades
+            "multiknife": "knife",
+            "sword": "knife",
+            "long sword": "knife",
+            "short sword": "knife",
+            "ax": "knife",
+            "cleaver": "knife",
+            "cutter": "knife",
+            "spear": "knife",
+            "eto": "knife",
+            
+            # Normalize baggage
+            "bag": "baggage"
         }
 
         # 📌 KEY CONCEPT: Sliding Window List (Rolling Log)
@@ -144,22 +169,36 @@ class Detector:
                 box_w = x2 - x1
                 box_h = y2 - y1
 
-                # Guns/rifles are larger objects — but if they are far away, 40 is too strict.
-                # Changing back to 30px to catch distant guns while still ignoring tiny shadows.
-                GUN_CLASSES = {"pistol", "rifle", "ak", "m16", "revolver",
-                               "semi automatic", "shotgun", "handgun"}
-                min_box = 30 if name in GUN_CLASSES else 25
+                # CCTV cameras show distant objects → smaller bounding boxes
+                # Using 20px minimum to catch weapons at distance while filtering noise
+                ALL_WEAPON_CLASSES = {
+                    "pistol", "rifle", "ak", "m16", "revolver",
+                    "semi automatic", "shotgun", "handgun", "handgunth",
+                    "shotgunth", "gun", "armed man", "person with a gun",
+                    "knife", "multiknife", "sword", "long sword", "short sword",
+                    "ax", "cleaver", "cutter", "spear", "eto"
+                }
+                min_box = 20 if name in ALL_WEAPON_CLASSES else 18
                 if box_w < min_box or box_h < min_box:
                     continue  # Too small → shadow/noise, skip
 
                 # ── Per-class confidence boosts ───────────────────────────────
-                # Knife: high dataset bias → needs boost to reduce false positives
-                # Guns: REMOVED boost — deep audit showed model sees guns at low conf (0.10-0.26)
-                #       Real guns are already protected by: min_box=30px + weapon_persist=6 frames
+                # Confidence boosts per class to reduce false positives:
+                # "armed man" is very noisy in fight scenes → needs high boost
+                # Melee weapons: high false positive rate → need confidence boost
+                # Guns (handgun/rifle/etc): no boost — model sees them at low conf naturally
                 class_boost = {
-                    "knife":          0.12,
-                    "cutter":         0.12,
-                    "cleaver":        0.10,
+                    "armed man":          0.25,  # Very noisy in fights — require conf > 0.50
+                    "person with a gun":  0.20,  # Also noisy
+                    "knife":              0.12,
+                    "cutter":             0.12,
+                    "cleaver":            0.10,
+                    "sword":              0.10,
+                    "long sword":         0.10,
+                    "short sword":        0.10,
+                    "ax":                 0.10,
+                    "spear":              0.08,
+                    "multiknife":         0.10,
                 }
                 boost = class_boost.get(name, 0.0)
                 min_conf = min(conf_threshold + boost, 0.80)
@@ -171,7 +210,34 @@ class Detector:
                 # Add to results
                 detections.append((x1, y1, x2, y2, float(conf), name))
 
-        return detections
+        # ── Agnostic NMS (Non-Maximum Suppression) ────────────────────
+        # Since we mapped many overlapping classes to the same name (e.g. 'gun'),
+        # we might have multiple 'gun' bounding boxes for the exact same object.
+        # We need to suppress the lower confidence duplicates.
+        def _iou(boxA, boxB):
+            xA = max(boxA[0], boxB[0])
+            yA = max(boxA[1], boxB[1])
+            xB = min(boxA[2], boxB[2])
+            yB = min(boxA[3], boxB[3])
+            interArea = max(0, xB - xA) * max(0, yB - yA)
+            boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+            boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+            return interArea / float(boxAArea + boxBArea - interArea) if (boxAArea + boxBArea - interArea) > 0 else 0.0
+
+        final_detections = []
+        # Sort by confidence descending
+        detections.sort(key=lambda x: x[4], reverse=True)
+        for d in detections:
+            overlap = False
+            for fd in final_detections:
+                # If they have the same unified class (e.g., both are 'gun') and overlap heavily
+                if d[5] == fd[5] and _iou(d, fd) > 0.45:
+                    overlap = True
+                    break
+            if not overlap:
+                final_detections.append(d)
+
+        return final_detections
 
     # ┌──────────────────────────────────────────────────────────────┐
     # │  GET LATENCY STATS                                           │
