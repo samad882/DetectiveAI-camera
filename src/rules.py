@@ -73,14 +73,16 @@ class RuleEngine:
     # │  Maps a class name string → category (person / bag / weapon)     │
     # └──────────────────────────────────────────────────────────────────┘
     def _classify(self, name):
-        # 📌 KEY CONCEPT: Case-insensitive classification
-        # Lowercase name so 'HandGun', 'BAGGAGE', 'Armed Man' all match correctly
+        # Multi-label classification: returns a SET of categories
+        # This is the core ontology fix — 'armed man' is BOTH a person AND a weapon
+        # Old system returned a single string and caused cascading failures.
         n = name.lower()
-        # ⚠️ Check WEAPON first — 'person with a gun' should be WEAPON not PERSON
-        if any(k in n for k in WEAPON_KEYWORDS): return "weapon"
-        if any(k in n for k in BAG_KEYWORDS):    return "bag"
-        if any(k in n for k in PERSON_KEYWORDS): return "person"
-        return None
+        labels = set()
+        if any(k in n for k in WEAPON_KEYWORDS): labels.add("weapon")
+        if any(k in n for k in BAG_KEYWORDS):    labels.add("bag")
+        # Person check: 'person' keyword OR 'armed man' (he is still a human)
+        if any(k in n for k in PERSON_KEYWORDS) or n == "armed man": labels.add("person")
+        return labels  # e.g. {"weapon", "person"} for "armed man"
 
     # ┌──────────────────────────────────────────────────────────────────┐
     # │  PROCESS                                                         │
@@ -122,16 +124,23 @@ class RuleEngine:
             x1, y1, x2, y2 = int(ltrb[0]), int(ltrb[1]), int(ltrb[2]), int(ltrb[3])
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
 
-            # Get class name safely (DeepSORT can return None)
-            name     = (t.get_det_class() or "unknown").lower()
-            category = self._classify(name)
+            # Get class name + confidence safely
+            name = (t.get_det_class() or "unknown").lower()
+            conf = t.get_det_conf() if hasattr(t, "get_det_conf") else 0.5
 
-            if category == "person":
-                persons_tracked[tid]  = {"bbox": (x1, y1, x2, y2), "center": (cx, cy)}
-            elif category == "bag":
-                bags_tracked[tid]     = {"bbox": (x1, y1, x2, y2), "center": (cx, cy)}
-            elif category == "weapon":
-                weapon_candidates[tid] = {"bbox": (x1, y1, x2, y2), "center": (cx, cy), "name": name}
+            # ── FIX 1: Multi-Label Ontology ───────────────────────────────
+            # _classify() now returns a SET. This means "armed man" maps to
+            # {"person", "weapon"} simultaneously — he IS a person AND a threat.
+            # Before this fix: armed man vanished from crowd/fight detection.
+            categories = self._classify(name)
+
+            if "person" in categories:
+                persons_tracked[tid] = {"bbox": (x1, y1, x2, y2), "center": (cx, cy)}
+            if "bag" in categories:
+                bags_tracked[tid] = {"bbox": (x1, y1, x2, y2), "center": (cx, cy)}
+            if "weapon" in categories:
+                weapon_candidates[tid] = {"bbox": (x1, y1, x2, y2), "center": (cx, cy),
+                                          "name": name, "conf": conf}
 
         # 📌 KEY CONCEPT: Garbage Collection / Manual Memory Management
         # Remove disappeared track IDs from all state dicts — prevents unbounded memory growth
@@ -211,55 +220,79 @@ class RuleEngine:
                         self.last_alert_time["bag"] = now
                         entry["first_seen"] = now  # Reset timer after alert
 
-        # ── RULE 3: WEAPON ───────────────────────────────────────────
-        # Only runs if model can detect weapons
+        # ── RULE 3: WEAPON (Enterprise-Grade) ───────────────────────────
         if self.has_weapons:
+
+            # Helper: does weapon centroid fall inside (or near) any person bbox?
+            def _weapon_has_owner(w_bbox, p_dict, px_margin=80):
+                """
+                FIX 3 — Spatial Weapon Ownership (Bi-partite Matching).
+                A weapon floating in empty air = CCTV glare/noise.
+                A weapon inside/near a person bbox = real threat.
+                px_margin accounts for arm/hand reach beyond person bbox.
+                """
+                wx1, wy1, wx2, wy2 = w_bbox
+                wcx = (wx1 + wx2) / 2
+                wcy = (wy1 + wy2) / 2
+                for pinfo in p_dict.values():
+                    px1, py1, px2, py2 = pinfo["bbox"]
+                    # Expand person box by margin for hand/arm reach
+                    if (px1 - px_margin) <= wcx <= (px2 + px_margin) and \
+                       (py1 - px_margin) <= wcy <= (py2 + px_margin):
+                        return True
+                return False
+
             for tid, winfo in weapon_candidates.items():
 
-                # ── Filter 1: Suppress "armed man" during active fights ──
-                # Fighting people look like "armed man" to the model
+                # Suppress armed man alerts during active fights (fight is noisy)
                 is_fight_active = (now - self.last_alert_time.get("fight", 0.0)) < 15.0
                 if is_fight_active and winfo["name"] == "armed man":
                     continue
 
-                # ── Filter 2: Aspect ratio sanity check ──────────────
-                # Real weapons have distinctive shapes:
-                #   gun  → wide (aspect > 1.3) or clearly elongated
-                #   knife → tall (aspect < 0.8) or elongated
-                # Square-ish boxes (0.8 < aspect < 1.3) for gun/knife = noise
-                bx1, by1, bx2, by2 = winfo["bbox"]
-                bw = max(1, bx2 - bx1)
-                bh = max(1, by2 - by1)
-                aspect = bw / bh
-                if winfo["name"] == "gun" and 0.7 < aspect < 1.4:
-                    continue  # Gun boxes should NOT be square
-                if winfo["name"] == "knife" and 0.6 < aspect < 1.5:
-                    continue  # Knife boxes should be elongated (tall or wide)
+                # FIX 2: Aspect ratio filter REMOVED.
+                # Brittle heuristic that caused false negatives in top-down CCTV.
+                # A gun aimed at the camera = square box — old filter was dropping it.
+                # Trust the neural network confidence instead.
 
-                # ── Filter 3: Consecutive frame counter + confidence averaging ──
-                # Track both frame count AND running confidence sum
-                prev = self.weapon_persist.get(tid, {"count": 0, "conf_sum": 0.0})
+                # FIX 3: Weapon Ownership Check
+                # gun/knife must be held by someone — not floating in empty air.
+                # armed man IS the person, so skip the check for him.
+                if winfo["name"] != "armed man":
+                    if not _weapon_has_owner(winfo["bbox"], persons_tracked):
+                        # No nearby person → likely noise/glare. Reset counter.
+                        self.weapon_persist.pop(tid, None)
+                        continue
+
+                # FIX 4: EMA Confidence Averaging
+                # EMA smooths out one-frame spikes: real weapons sustain high conf.
+                # Formula: ema = 0.7 * new_conf + 0.3 * old_ema
+                current_conf = winfo.get("conf", 0.5)
+                prev = self.weapon_persist.get(tid, {"count": 0, "ema_conf": current_conf})
                 prev["count"] = prev.get("count", 0) + 1
-                # Extract confidence from bbox tuple stored by process()
-                # winfo has bbox but no conf — get it from the track
-                prev["conf_sum"] = prev.get("conf_sum", 0.0)
+                old_ema = prev.get("ema_conf", current_conf)
+                prev["ema_conf"] = 0.7 * current_conf + 0.3 * old_ema
                 self.weapon_persist[tid] = prev
 
-                # Alert only after N consecutive frames
-                if prev["count"] >= self.weapon_persist_frames:
-                    # Double cooldown: global + per-track
+                # Per-class EMA threshold: armed man needs highest bar
+                ema_min = {"gun": 0.48, "knife": 0.50, "armed man": 0.58}.get(winfo["name"], 0.48)
+
+                # Alert only after N frames AND EMA conf sustained above threshold
+                if (prev["count"] >= self.weapon_persist_frames and
+                        prev["ema_conf"] >= ema_min):
                     last_tid_time = self.last_weapon_alert_for_tid.get(tid, 0.0)
                     if (now - last_tid_time >= self.alert_cooldowns["weapon"] and
                             now - self.last_alert_time["weapon"] >= self.alert_cooldowns["weapon"]):
                         weapon_display_name = winfo["name"].title()
                         alerts.append({
                             "type": f"THREAT: {weapon_display_name}",
-                            "message": f"Weapon detected!",
+                            "message": f"Weapon detected! (conf={prev['ema_conf']:.0%})",
                             "timestamp": now, "frame_idx": frame_index,
                             "bbox": winfo["bbox"], "track_id": tid
                         })
                         self.last_alert_time["weapon"] = now
                         self.last_weapon_alert_for_tid[tid] = now
+
+
 
 
         # ── RULE 4: SMART FIGHT DETECTION (Proximity + Motion) ───────

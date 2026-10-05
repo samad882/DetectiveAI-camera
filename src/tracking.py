@@ -53,14 +53,24 @@ class Tracker:
 
         # ── DeepSORT Path ───────────────────────────────────────────────
         if self.use_deepsort:
-            # 📌 KEY CONCEPT: Format Conversion (xyxy → xywh)
-            # DeepSORT expects [x1, y1, width, height] not corner coords — simple arithmetic transform
             # DeepSORT needs [x1, y1, width, height] not [x1,y1,x2,y2]
-            ds_input = [
-                ([x1, y1, x2 - x1, y2 - y1], conf, name)
-                for (x1, y1, x2, y2, conf, name) in detections
-            ]
+            # We also store a conf lookup so rules.py can do EMA confidence averaging
+            conf_lookup = {}  # class_name+bbox key → conf
+            ds_input = []
+            for (x1, y1, x2, y2, conf, name) in detections:
+                ds_input.append(([x1, y1, x2 - x1, y2 - y1], conf, name))
+                # Key: class name (one weapon per class per frame — good enough)
+                conf_lookup[name] = max(conf_lookup.get(name, 0.0), conf)
+
             tracks = self.tracker.update_tracks(ds_input, frame=frame)
+
+            # Inject conf into each track object so rules.py can access it
+            # DeepSORT tracks don't have get_det_conf() — we add it dynamically
+            for track in tracks:
+                det_class = track.get_det_class() or ""
+                stored_conf = conf_lookup.get(det_class.lower(), 0.0)
+                track.get_det_conf = lambda c=stored_conf: c  # closure captures value
+
             return tracks
 
         # ── Fallback Centroid Tracker ────────────────────────────────────
@@ -105,6 +115,7 @@ class Tracker:
                     "bbox": (int(x1), int(y1), int(x2), int(y2)),
                     "centroid": (cx, cy),
                     "name": name,
+                    "conf": float(conf),   # ← preserve confidence for EMA in rules.py
                     "age": 0,
                     "hits": self.objects.get(oid, {}).get("hits", 0) + 1
                 }
@@ -131,7 +142,6 @@ class Tracker:
                     self._obj = obj
 
                 def is_confirmed(self):
-                    # Confirmed after at least 1 hit
                     return self._obj.get("hits", 0) > 0
 
                 def to_ltrb(self):
@@ -140,5 +150,9 @@ class Tracker:
 
                 def get_det_class(self):
                     return self._obj.get("name", "unknown")
+
+                def get_det_conf(self):
+                    # Returns latest detection confidence (preserved from detection.py output)
+                    return self._obj.get("conf", 0.0)
 
             return [SimpleTrack(tid, obj) for tid, obj in self.objects.items()]
