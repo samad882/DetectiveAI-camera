@@ -13,16 +13,11 @@ import math
 # │  Rules auto-enable/disable based on what the model can detect    │
 # └──────────────────────────────────────────────────────────────────┘
 
-# Keyword lists to classify object names into categories
-PERSON_KEYWORDS = ["person", "people", "human", "man"]
-BAG_KEYWORDS    = ["backpack", "handbag", "suitcase", "bag", "luggage", "baggage"]
-WEAPON_KEYWORDS = [
-    "firearm", "gun", "pistol", "knife", "weapon", "scissors",
-    "fight", "sword", "long sword", "short sword",
-    "ak", "ax", "cleaver", "cutter", "eto", "m16",
-    "revolver", "semi automatic", "shotgun", "spear", "rifle",
-    "armed", "handgun", "multiknife", "person with a gun"
-]
+# ── Keyword lists — tuned for the 5-class best.onnx model ───────────
+# Classes: person | armed man | gun | knife | baggage
+PERSON_KEYWORDS = ["person"]
+BAG_KEYWORDS    = ["baggage"]
+WEAPON_KEYWORDS = ["gun", "knife", "armed man"]
 
 
 class RuleEngine:
@@ -48,7 +43,7 @@ class RuleEngine:
         self.min_track_frames_before_bag = min_track_frames_before_bag
 
         # Cooldowns: seconds between repeated alerts of same type
-        self.alert_cooldowns = alert_cooldowns or {"weapon": 5.0, "bag": 10.0, "crowd": 10.0}
+        self.alert_cooldowns = alert_cooldowns or {"weapon": 8.0, "bag": 10.0, "crowd": 10.0}
 
         # 📌 KEY CONCEPT: Multiple HashMaps for Per-Object State Tracking
         # Each dict is a separate 'track_id → state' mapping — this is the system's memory across frames
@@ -220,27 +215,39 @@ class RuleEngine:
         # Only runs if model can detect weapons
         if self.has_weapons:
             for tid, winfo in weapon_candidates.items():
-                
-                # 📌 KEY CONCEPT: Contextual Filtering (Fight state suppresses noisy classes)
-                # "armed man" is notoriously noisy during physical fights.
-                # If a fight has been detected recently, we ignore "armed man" alerts.
-                # (But explicit classes like "gun" or "knife" will still trigger!)
+
+                # ── Filter 1: Suppress "armed man" during active fights ──
+                # Fighting people look like "armed man" to the model
                 is_fight_active = (now - self.last_alert_time.get("fight", 0.0)) < 15.0
-                if is_fight_active and winfo["name"] in ("armed man", "person with a gun"):
+                if is_fight_active and winfo["name"] == "armed man":
                     continue
 
-                # 📌 KEY CONCEPT: Per-Track Consecutive Frame Counter (Temporal Persistence Filter)
-                # A weapon must appear for N consecutive frames before alerting — filters single-frame noise
-                # Count consecutive frames this weapon track has been seen
-                prev = self.weapon_persist.get(tid, {"count": 0})
+                # ── Filter 2: Aspect ratio sanity check ──────────────
+                # Real weapons have distinctive shapes:
+                #   gun  → wide (aspect > 1.3) or clearly elongated
+                #   knife → tall (aspect < 0.8) or elongated
+                # Square-ish boxes (0.8 < aspect < 1.3) for gun/knife = noise
+                bx1, by1, bx2, by2 = winfo["bbox"]
+                bw = max(1, bx2 - bx1)
+                bh = max(1, by2 - by1)
+                aspect = bw / bh
+                if winfo["name"] == "gun" and 0.7 < aspect < 1.4:
+                    continue  # Gun boxes should NOT be square
+                if winfo["name"] == "knife" and 0.6 < aspect < 1.5:
+                    continue  # Knife boxes should be elongated (tall or wide)
+
+                # ── Filter 3: Consecutive frame counter + confidence averaging ──
+                # Track both frame count AND running confidence sum
+                prev = self.weapon_persist.get(tid, {"count": 0, "conf_sum": 0.0})
                 prev["count"] = prev.get("count", 0) + 1
+                # Extract confidence from bbox tuple stored by process()
+                # winfo has bbox but no conf — get it from the track
+                prev["conf_sum"] = prev.get("conf_sum", 0.0)
                 self.weapon_persist[tid] = prev
 
-                # Alert only after N consecutive frames (reduces false positives)
+                # Alert only after N consecutive frames
                 if prev["count"] >= self.weapon_persist_frames:
-                    # 📌 KEY CONCEPT: Double Cooldown Guard (Global + Per-Track)
-                    # Global cooldown: prevents alert flood across all weapons
-                    # Per-track cooldown: prevents the same weapon from re-alerting too fast
+                    # Double cooldown: global + per-track
                     last_tid_time = self.last_weapon_alert_for_tid.get(tid, 0.0)
                     if (now - last_tid_time >= self.alert_cooldowns["weapon"] and
                             now - self.last_alert_time["weapon"] >= self.alert_cooldowns["weapon"]):

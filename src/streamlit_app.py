@@ -165,10 +165,10 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 
 # --- Config ---
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "best.onnx")
-CONF_THRESHOLD = 0.40  # Raised from 0.20 → 0.40 to eliminate false detections
+CONF_THRESHOLD = 0.35  # Base threshold — per-class thresholds in detection.py override this
 CROWD_THRESHOLD = 20
 BAG_STATIONARY_SECONDS = 5
-WEAPON_PERSIST_FRAMES = 2  # Low FPS (3-10) pe 2 frames kaafi — zyada rakhne par alerts miss hote hain
+WEAPON_PERSIST_FRAMES = 5  # Weapon must appear in 5 consecutive frames (~1s at 5fps) before alert
 
 # --- Header ---
 st.markdown("""
@@ -218,7 +218,7 @@ if st.sidebar.button("⏹  Stop", use_container_width=True):
     st.session_state.running = False
 
 st.sidebar.divider()
-st.sidebar.caption("Model: `bestox.onnx` · Classes: pistol, knife")
+st.sidebar.caption("Model: `best.onnx` · Classes: person, armed man, gun, knife, baggage")
 st.sidebar.caption(f"Persist: {WEAPON_PERSIST_FRAMES} frames")
 
 # --- Main Layout ---
@@ -282,13 +282,9 @@ if st.session_state.running and video_path is not None:
     try:
         detector = load_model(MODEL_PATH)
 
-        # Apply remap BEFORE passing to RuleEngine
-        raw_classes = list(detector.names.values()) if detector.names else []
-        model_classes = []
-        for c in raw_classes:
-            c_lower = c.lower()
-            remapped = detector.class_remap.get(c_lower, c_lower)
-            model_classes.append(remapped)
+        # Pass model class names directly to RuleEngine
+        # New model has clean classes: person, armed man, gun, knife, baggage
+        model_classes = [c.lower() for c in detector.names.values()] if detector.names else []
 
         logger.info(f"Model loaded. Classes: {model_classes}")
 
