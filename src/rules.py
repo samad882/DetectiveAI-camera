@@ -364,7 +364,7 @@ class RuleEngine:
                 if now - self.last_alert_time["fight"] >= 10.0:  # 10s cooldown
                     alerts.append({
                         "type": "FIGHT",
-                        "message": f"⚠️ Physical altercation! ({num_persons} persons in contact + motion)",
+                        "message": f"⚠️ (FIGHT) A physical altercation is detected!",
                         "timestamp": now,
                         "frame_idx": frame_index
                     })
