@@ -164,7 +164,7 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
 
 
 # --- Config ---
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "bestonnx.onnx")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "best.onnx")
 CONF_THRESHOLD = 0.40  # Raised from 0.20 → 0.40 to eliminate false detections
 CROWD_THRESHOLD = 20
 BAG_STATIONARY_SECONDS = 5
@@ -218,7 +218,7 @@ if st.sidebar.button("⏹  Stop", use_container_width=True):
     st.session_state.running = False
 
 st.sidebar.divider()
-st.sidebar.caption("Model: `bestonnx.onnx` · Classes: pistol, knife")
+st.sidebar.caption("Model: `bestox.onnx` · Classes: pistol, knife")
 st.sidebar.caption(f"Persist: {WEAPON_PERSIST_FRAMES} frames")
 
 # --- Main Layout ---
@@ -348,7 +348,12 @@ if st.session_state.running and video_path is not None:
 
                 try:
                     dets    = detector.detect(frame, conf_threshold=CONF_THRESHOLD, img_size=320)
-                    tracks  = tracker.update(dets, frame)
+                    
+                    # 📌 This new HuggingFace model only has classes like 'Gun', 'knife', 'grenade'
+                    # No need to filter out 'person' or 'armed man' because this model doesn't even know what a person is!
+                    weapon_dets = dets 
+                            
+                    tracks  = tracker.update(weapon_dets, frame)
                     alerts  = rules.process(tracks, local_frame_idx, frame_timestamp=time.time())
 
                     result_store["tracks"]  = tracks
