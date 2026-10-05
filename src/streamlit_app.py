@@ -241,7 +241,7 @@ if not st.session_state.running:
         st.markdown("""
         <div style="height:340px; background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px;
                     display:flex; align-items:center; justify-content:center; flex-direction:column; gap:8px;">
-            <span style="font-size:32px">📹</span>
+            <span style="font-size:32px">+</span>
             <span style="font-size:14px; color:#9ca3af;">Select a source and press Start</span>
         </div>
         """, unsafe_allow_html=True)
