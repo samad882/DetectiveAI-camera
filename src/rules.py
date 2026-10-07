@@ -276,8 +276,19 @@ class RuleEngine:
                 # Per-class EMA threshold: armed man needs highest bar
                 ema_min = {"gun": 0.48, "knife": 0.50, "armed man": 0.58}.get(winfo["name"], 0.48)
 
-                # Alert only after N frames AND EMA conf sustained above threshold
-                if (prev["count"] >= self.weapon_persist_frames and
+                # ── ENTERPRISE FIX: Hierarchical Verification ──────────────
+                # Level 1 (Evidence): Gun / Knife -> Fast alert (5 frames)
+                # Level 2 (Suspicion): Armed Man -> Slow alert (25 frames, ~5s)
+                # This prevents "Alert Fatigue" from people lifting phones/bags.
+                if winfo["name"] == "armed man":
+                    required_frames = 25  # Require ~5 seconds of sustained suspicion
+                    msg_prefix = "Suspicious Armed Man"
+                else:
+                    required_frames = self.weapon_persist_frames  # Standard 5 frames
+                    msg_prefix = "Weapon (Gun/Knife)"
+
+                # Alert only after REQUIRED frames AND EMA conf sustained above threshold
+                if (prev["count"] >= required_frames and
                         prev["ema_conf"] >= ema_min):
                     last_tid_time = self.last_weapon_alert_for_tid.get(tid, 0.0)
                     if (now - last_tid_time >= self.alert_cooldowns["weapon"] and
@@ -285,7 +296,7 @@ class RuleEngine:
                         weapon_display_name = winfo["name"].title()
                         alerts.append({
                             "type": f"THREAT: {weapon_display_name}",
-                            "message": f"Weapon detected! (conf={prev['ema_conf']:.0%})",
+                            "message": f"⚠️ {msg_prefix} detected! (conf={prev['ema_conf']:.0%})",
                             "timestamp": now, "frame_idx": frame_index,
                             "bbox": winfo["bbox"], "track_id": tid
                         })
