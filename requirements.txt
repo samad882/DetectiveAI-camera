@@ -7,5 +7,7 @@ pillow
 huggingface_hub
 streamlit-webrtc
 av
+requests
+python-dotenv
 
 # pip install -U ultralytics opencv-python streamlit huggingface_hub deep_sort_realtime

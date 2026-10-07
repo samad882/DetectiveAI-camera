@@ -21,6 +21,7 @@ from detection import Detector
 from tracking import Tracker
 from rules import RuleEngine
 from visualize import draw_tracks, draw_alerts
+from telegramalert import TelegramNotifier
 
 
 @st.cache_resource
@@ -333,6 +334,7 @@ if st.session_state.running and video_path is not None:
               - AI runs at its natural speed (6-7 FPS on Mac CPU)
               - Display runs at full capture speed
             """
+            notifier = TelegramNotifier(min_strikes=1, cooldown_seconds=60)
             local_frame_idx = 0
             while not stop_event.is_set():
                 try:
@@ -358,6 +360,9 @@ if st.session_state.running and video_path is not None:
 
                     if alerts:
                         logger.warning(f"ALERT frame={local_frame_idx}: {[a['type'] for a in alerts]}")
+                        for alert in alerts:
+                            notifier.process_alert(alert, frame)
+                            
                     if dets:
                         logger.info(f"DETECT frame={local_frame_idx}: {[(d[5], round(d[4],2)) for d in dets]}")
 

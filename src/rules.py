@@ -43,7 +43,7 @@ class RuleEngine:
         self.min_track_frames_before_bag = min_track_frames_before_bag
 
         # Cooldowns: seconds between repeated alerts of same type
-        self.alert_cooldowns = alert_cooldowns or {"weapon": 8.0, "bag": 10.0, "crowd": 10.0}
+        self.alert_cooldowns = alert_cooldowns or {"weapon": 2.0, "bag": 2.0, "crowd": 2.0}
 
         # 📌 KEY CONCEPT: Multiple HashMaps for Per-Object State Tracking
         # Each dict is a separate 'track_id → state' mapping — this is the system's memory across frames
@@ -298,7 +298,8 @@ class RuleEngine:
                             "type": f"THREAT: {weapon_display_name}",
                             "message": f"⚠️ {msg_prefix} detected! (conf={prev['ema_conf']:.0%})",
                             "timestamp": now, "frame_idx": frame_index,
-                            "bbox": winfo["bbox"], "track_id": tid
+                            "bbox": winfo["bbox"], "track_id": tid,
+                            "conf": prev['ema_conf']
                         })
                         self.last_alert_time["weapon"] = now
                         self.last_weapon_alert_for_tid[tid] = now
@@ -405,7 +406,7 @@ class RuleEngine:
                 self.fight_proximity_counter = max(0, self.fight_proximity_counter - 2)
 
             if self.fight_proximity_counter >= FIGHT_PROXIMITY_FRAMES:
-                if now - self.last_alert_time["fight"] >= 10.0:  # 10s cooldown
+                if now - self.last_alert_time.get("fight", 0.0) >= 2.0:  # 2s cooldown for faster strikes
                     alerts.append({
                         "type": "FIGHT",
                         "message": f"⚠️ (FIGHT) A physical altercation is detected!",
